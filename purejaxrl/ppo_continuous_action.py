@@ -74,6 +74,9 @@ def make_train(config):
         config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
     env, env_params = BraxGymnaxWrapper(config["ENV_NAME"]), None
+
+    #! this is wrapped using classes
+    #! env = VecEnv(ClipAction(LogWrapper(env)))
     env = LogWrapper(env)
     env = ClipAction(env)
     env = VecEnv(env)
