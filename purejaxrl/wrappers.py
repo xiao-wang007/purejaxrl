@@ -268,7 +268,7 @@ class NormalizeVecObservation(GymnaxWrapper):
         batch_count = obs.shape[0]
 
         delta = batch_mean - state.mean
-        tot_count = state.count + batch_count
+        tot_count = state.count + batch_count #! total is increasing until reset()
 
         new_mean = state.mean + delta * batch_count / tot_count
         m_a = state.var * state.count

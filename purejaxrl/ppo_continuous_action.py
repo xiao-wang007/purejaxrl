@@ -76,7 +76,8 @@ def make_train(config):
     env, env_params = BraxGymnaxWrapper(config["ENV_NAME"]), None
 
     #! this is wrapped using classes
-    #! env = VecEnv(ClipAction(LogWrapper(env)))
+    #! env = VecEnv(ClipAction(LogWrapper(env))), so when called by env.step()
+    #! it goes from out-to-in
     env = LogWrapper(env)
     env = ClipAction(env)
     env = VecEnv(env)
@@ -100,6 +101,8 @@ def make_train(config):
         rng, _rng = jax.random.split(rng)
         init_x = jnp.zeros(env.observation_space(env_params).shape)
         network_params = network.init(_rng, init_x)
+        
+        #! optax is the optimizer package with gradient transformation for JAX
         if config["ANNEAL_LR"]:
             tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
@@ -110,6 +113,8 @@ def make_train(config):
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
                 optax.adam(config["LR"], eps=1e-5),
             )
+        
+        #! TrainState is a training level dataclass
         train_state = TrainState.create(
             apply_fn=network.apply,
             params=network_params,
@@ -128,9 +133,20 @@ def make_train(config):
                 train_state, env_state, last_obs, rng = runner_state
 
                 # SELECT ACTION
+                #! returns two new independent PRNG keys because JAX RNG
+                #! is a functional, but the convention here is to use _rng
+                #! for the immediate next operation, and rng got carried over
+                #! for future
                 rng, _rng = jax.random.split(rng)
+                #! does not naively deep-copy full parameter trees on every call. 
+                #! Think “efficient buffer references with functional semantics,”
+                #! not Python-level pointer mutation.
                 pi, value = network.apply(train_state.params, last_obs)
                 action = pi.sample(seed=_rng)
+                #! pi is a distribution over actions conditioned on s, therefore
+                #! gives µ and σ. This defines pi(*|s), which evaluates to probability
+                #! then after a sample is drawn, plug it into the policy give its 
+                #! probability, log_prob gives log pi(a|s) 
                 log_prob = pi.log_prob(action)
 
                 # STEP ENV
