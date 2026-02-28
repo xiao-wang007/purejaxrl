@@ -158,14 +158,22 @@ def make_train(config):
                 transition = Transition(
                     done, action, value, reward, log_prob, last_obs, info
                 )
+
+                #! runner_state is the carry for jax.lax.scan, must keep a 
+                #! a fixed structure each iteration
                 runner_state = (train_state, env_state, obsv, rng)
                 return runner_state, transition
 
+            #! scan represents loop control flow. It traces/compiles the loop
+            #! body once as a reusable computation, then executes it for 
+            #! NUM_STEPS iterations with carries state.
             runner_state, traj_batch = jax.lax.scan(
                 _env_step, runner_state, None, config["NUM_STEPS"]
             )
 
             # CALCULATE ADVANTAGE
+            #! runner_state from the above scan contains the return of last
+            #! iteration
             train_state, env_state, last_obs, rng = runner_state
             _, last_val = network.apply(train_state.params, last_obs)
 
