@@ -191,7 +191,14 @@ def make_train(config):
                         + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
                     )
                     return (gae, value), gae
+                
+                #! .scan(f, init, xs)
+                #! f: the step function f(carry, x) -> (new_carry, y)
+                #! init: the initial carry, which goes to the 1st arg of f, i.e. carry, whose
+                #!       form must be fixed for scan to work.
+                #! xs: the sequence to iterate over, each element goes to the 2nd arg of f
 
+                #! advantages contain the full recursion, and the last carry is ignored by _
                 _, advantages = jax.lax.scan(
                     _get_advantages,
                     (jnp.zeros_like(last_val), last_val),
@@ -199,7 +206,7 @@ def make_train(config):
                     reverse=True,
                     unroll=16,
                 )
-                return advantages, advantages + traj_batch.value
+                return advantages, advantages + traj_batch.value #! Vt_target = At + V(st)
 
             advantages, targets = _calculate_gae(traj_batch, last_val)
 
