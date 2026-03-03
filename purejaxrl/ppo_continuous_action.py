@@ -10,6 +10,7 @@ import distrax
 from wrappers import (
     LogWrapper,
     BraxGymnaxWrapper,
+    MJXGymnaxWrapper,
     VecEnv,
     NormalizeVecObservation,
     NormalizeVecReward,
@@ -73,7 +74,33 @@ def make_train(config):
     config["MINIBATCH_SIZE"] = (
         config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
-    env, env_params = BraxGymnaxWrapper(config["ENV_NAME"]), None
+    env_backend = config.get("ENV_BACKEND", "brax")
+    if env_backend == "brax":
+        env = BraxGymnaxWrapper(config["ENV_NAME"])
+    elif env_backend == "mjx":
+        if "MJX_ENV" not in config:
+            raise ValueError(
+                "When ENV_BACKEND='mjx', pass a built MJX env object in config['MJX_ENV']."
+            )
+        env = MJXGymnaxWrapper(
+            config["MJX_ENV"],
+            observation_size=config.get("OBSERVATION_SIZE"),
+            action_size=config.get("ACTION_SIZE"),
+            action_low=config.get("ACTION_LOW", -1.0),
+            action_high=config.get("ACTION_HIGH", 1.0),
+            obs_attr_names=config.get(
+                "OBS_ATTR_NAMES", ("obs", "observation", "observations")
+            ),
+            reward_attr_names=config.get("REWARD_ATTR_NAMES", ("reward",)),
+            done_attr_names=config.get(
+                "DONE_ATTR_NAMES", ("done", "terminated", "is_terminal", "is_done")
+            ),
+        )
+    else:
+        raise ValueError(
+            f"Unknown ENV_BACKEND='{env_backend}'. Supported values: 'brax', 'mjx'."
+        )
+    env_params = None
 
     #! this is wrapped using classes
     #! env = VecEnv(ClipAction(LogWrapper(env))), so when called by env.step()
@@ -337,6 +364,7 @@ if __name__ == "__main__":
         "VF_COEF": 0.5,
         "MAX_GRAD_NORM": 0.5,
         "ACTIVATION": "tanh",
+        "ENV_BACKEND": "brax",
         "ENV_NAME": "hopper",
         "ANNEAL_LR": False,
         "NORMALIZE_ENV": True,

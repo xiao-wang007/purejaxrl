@@ -145,6 +145,121 @@ class BraxGymnaxWrapper:
             shape=(self._env.action_size,),
         )
 
+
+class MJXGymnaxWrapper:
+    """Adapts a raw MJX env object to the Gymnax-style API used by PureJaxRL."""
+
+    def __init__(
+        self,
+        env,
+        observation_size=None,
+        action_size=None,
+        action_low=-1.0,
+        action_high=1.0,
+        obs_attr_names=("obs", "observation", "observations"),
+        reward_attr_names=("reward",),
+        done_attr_names=("done", "terminated", "is_terminal", "is_done"),
+    ):
+        self._env = env
+        self._observation_size = observation_size
+        self._action_size = action_size
+        self._action_low = action_low
+        self._action_high = action_high
+        self._obs_attr_names = obs_attr_names
+        self._reward_attr_names = reward_attr_names
+        self._done_attr_names = done_attr_names
+
+    def _first_attr(self, state, names):
+        for name in names:
+            if hasattr(state, name):
+                value = getattr(state, name)
+                return value() if callable(value) else value
+        return None
+
+    def _extract_obs(self, state):
+        obs = self._first_attr(state, self._obs_attr_names)
+        if obs is None:
+            raise ValueError(
+                "Could not extract observation from MJX state. "
+                "Provide one of obs_attr_names in MJXGymnaxWrapper."
+            )
+        return obs
+
+    def _extract_reward(self, state):
+        reward = self._first_attr(state, self._reward_attr_names)
+        if reward is None:
+            raise ValueError(
+                "Could not extract reward from MJX state. "
+                "Provide one of reward_attr_names in MJXGymnaxWrapper."
+            )
+        return reward
+
+    def _extract_done(self, state):
+        done = self._first_attr(state, self._done_attr_names)
+        if done is None:
+            raise ValueError(
+                "Could not extract done flag from MJX state. "
+                "Provide one of done_attr_names in MJXGymnaxWrapper."
+            )
+        return done > 0.5
+
+    def _call_with_optional_params(self, fn, *args, params=None):
+        if params is None:
+            return fn(*args)
+        try:
+            return fn(*args, params)
+        except TypeError:
+            return fn(*args)
+
+    def reset(self, key, params=None):
+        out = self._call_with_optional_params(self._env.reset, key, params=params)
+        if isinstance(out, tuple) and len(out) == 2:
+            obs, state = out
+            return obs, state
+        state = out
+        return self._extract_obs(state), state
+
+    def step(self, key, state, action, params=None):
+        del key  # Most MJX envs are deterministic given state/action.
+        out = self._call_with_optional_params(
+            self._env.step, state, action, params=params
+        )
+        if isinstance(out, tuple) and len(out) == 5:
+            obs, next_state, reward, done, info = out
+            return obs, next_state, reward, done, info
+        next_state = out
+        obs = self._extract_obs(next_state)
+        reward = self._extract_reward(next_state)
+        done = self._extract_done(next_state)
+        return obs, next_state, reward, done, {}
+
+    def observation_space(self, params):
+        del params
+        observation_size = self._observation_size
+        if observation_size is None:
+            observation_size = getattr(self._env, "observation_size", None)
+        if observation_size is None:
+            raise ValueError(
+                "MJX observation size is unknown. Pass observation_size to "
+                "MJXGymnaxWrapper."
+            )
+        return spaces.Box(low=-jnp.inf, high=jnp.inf, shape=(observation_size,))
+
+    def action_space(self, params):
+        del params
+        action_size = self._action_size
+        if action_size is None:
+            action_size = getattr(self._env, "action_size", None)
+        if action_size is None:
+            raise ValueError(
+                "MJX action size is unknown. Pass action_size to MJXGymnaxWrapper."
+            )
+        return spaces.Box(
+            low=self._action_low,
+            high=self._action_high,
+            shape=(action_size,),
+        )
+
 class NavixGymnaxWrapper:
     def __init__(self, env_name):
         self._env = nx.make(env_name)
