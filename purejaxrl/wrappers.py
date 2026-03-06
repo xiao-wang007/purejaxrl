@@ -147,8 +147,10 @@ class BraxGymnaxWrapper:
 
 
 class MJXGymnaxWrapper:
-    """Adapts a raw MJX env object to the Gymnax-style API used by PureJaxRL."""
-
+    """Adapts a raw MJX env object to the Gymnax-style API used by PureJaxRL.
+    # TODO do the obs noise, action noise, domain randomization in the wrapper, 
+    # TODO controlled by config/RNG 
+    """
     def __init__(
         self,
         env,
