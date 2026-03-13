@@ -157,7 +157,7 @@ def make_train(config):
         def _update_step(runner_state, unused):
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, unused):
-                train_state, env_state, last_obs, rng = runner_state
+                train_state, env_state, last_obs, rng, global_train_step = runner_state
 
                 # SELECT ACTION
                 #! returns two new independent PRNG keys because JAX RNG
@@ -179,8 +179,9 @@ def make_train(config):
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
                 rng_step = jax.random.split(_rng, config["NUM_ENVS"])
+                step_env_params = {"train_step": global_train_step}
                 obsv, env_state, reward, done, info = env.step(
-                    rng_step, env_state, action, env_params
+                    rng_step, env_state, action, step_env_params
                 )
                 transition = Transition(
                     done, action, value, reward, log_prob, last_obs, info
@@ -188,7 +189,13 @@ def make_train(config):
 
                 #! runner_state is the carry for jax.lax.scan, must keep a 
                 #! a fixed structure each iteration
-                runner_state = (train_state, env_state, obsv, rng)
+                runner_state = (
+                    train_state,
+                    env_state,
+                    obsv,
+                    rng,
+                    global_train_step + jnp.array(1, dtype=jnp.int32),
+                )
                 return runner_state, transition
 
             #! scan represents loop control flow. It traces/compiles the loop
@@ -201,7 +208,7 @@ def make_train(config):
             # CALCULATE ADVANTAGE
             #! runner_state from the above scan contains the return of last
             #! iteration
-            train_state, env_state, last_obs, rng = runner_state
+            train_state, env_state, last_obs, rng, global_train_step = runner_state
             _, last_val = network.apply(train_state.params, last_obs)
 
             def _calculate_gae(traj_batch, last_val):
@@ -336,11 +343,17 @@ def make_train(config):
 
                 jax.debug.callback(callback, metric)
 
-            runner_state = (train_state, env_state, last_obs, rng)
+            runner_state = (train_state, env_state, last_obs, rng, global_train_step)
             return runner_state, metric
 
         rng, _rng = jax.random.split(rng)
-        runner_state = (train_state, env_state, obsv, _rng)
+        runner_state = (
+            train_state,
+            env_state,
+            obsv,
+            _rng,
+            jnp.array(0, dtype=jnp.int32),
+        )
         runner_state, metric = jax.lax.scan(
             _update_step, runner_state, None, config["NUM_UPDATES"]
         )
@@ -353,7 +366,7 @@ if __name__ == "__main__":
     config = {
         "LR": 3e-4,
         "NUM_ENVS": 2048,
-        "NUM_STEPS": 10,
+        "NUM_STEPS": 200,  # my dt policy = 0.02, this is 4s rollout 
         "TOTAL_TIMESTEPS": 5e7,
         "UPDATE_EPOCHS": 4,
         "NUM_MINIBATCHES": 32,
@@ -364,8 +377,8 @@ if __name__ == "__main__":
         "VF_COEF": 0.5,
         "MAX_GRAD_NORM": 0.5,
         "ACTIVATION": "tanh",
-        "ENV_BACKEND": "brax",
-        "ENV_NAME": "hopper",
+        "ENV_BACKEND": "mjx",
+        "ENV_NAME": "franka",
         "ANNEAL_LR": False,
         "NORMALIZE_ENV": True,
         "DEBUG": True,

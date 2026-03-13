@@ -8,7 +8,11 @@ from typing import Optional, Tuple, Union, Any
 from gymnax.environments import environment, spaces
 from brax import envs
 from brax.envs.wrappers.training import EpisodeWrapper, AutoResetWrapper
-import navix as nx
+
+try:
+    import navix as nx
+except Exception:  # Navix import can fail on some JAX backends.
+    nx = None
 
 
 class GymnaxWrapper(object):
@@ -264,6 +268,11 @@ class MJXGymnaxWrapper:
 
 class NavixGymnaxWrapper:
     def __init__(self, env_name):
+        if nx is None:
+            raise ImportError(
+                "Navix is unavailable in this environment. Install/configure navix "
+                "or avoid NavixGymnaxWrapper."
+            )
         self._env = nx.make(env_name)
 
     def reset(self, key, params=None):
