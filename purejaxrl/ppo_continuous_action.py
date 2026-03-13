@@ -1,8 +1,10 @@
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
+from flax import serialization
 import numpy as np
 import optax
+import os
 from flax.linen.initializers import constant, orthogonal
 from typing import Sequence, NamedTuple, Any
 from flax.training.train_state import TrainState
@@ -157,6 +159,24 @@ def make_train(config):
             params=network_params,
             tx=tx,
         )
+        start_global_train_step = jnp.array(0, dtype=jnp.int32)
+        resume_path = config.get("RESUME_CHECKPOINT_PATH")
+        if resume_path:
+            if not os.path.exists(resume_path):
+                raise FileNotFoundError(
+                    f"RESUME_CHECKPOINT_PATH does not exist: {resume_path}"
+                )
+            with open(resume_path, "rb") as f:
+                checkpoint_bytes = f.read()
+            checkpoint_template = {
+                "train_state": train_state,
+                "global_train_step": jnp.array(0, dtype=jnp.int32),
+            }
+            checkpoint_data = serialization.from_bytes(
+                checkpoint_template, checkpoint_bytes
+            )
+            train_state = checkpoint_data["train_state"]
+            start_global_train_step = checkpoint_data["global_train_step"]
 
         # INIT ENV
         rng, _rng = jax.random.split(rng)
@@ -482,7 +502,7 @@ def make_train(config):
             env_state,
             obsv,
             _rng,
-            jnp.array(0, dtype=jnp.int32),
+            start_global_train_step,
         )
         if config.get("COLLECT_METRICS", True):
             runner_state, metric = jax.lax.scan(
