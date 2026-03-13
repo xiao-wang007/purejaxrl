@@ -6,6 +6,7 @@ import optax
 from flax.linen.initializers import constant, orthogonal
 from typing import Sequence, NamedTuple, Any
 from flax.training.train_state import TrainState
+from flax import serialization
 import distrax
 from wrappers import (
     LogWrapper,
@@ -148,6 +149,21 @@ def make_train(config):
             tx=tx,
         )
 
+        # --- Resume from checkpoint if provided ---
+        resumed_global_train_step = jnp.array(0, dtype=jnp.int32)
+        resume_path = config.get("RESUME_CHECKPOINT_PATH")
+        if resume_path is not None:
+            import pathlib
+            ckpt_bytes = pathlib.Path(resume_path).read_bytes()
+            restored = serialization.from_bytes(
+                {"train_state": train_state, "global_train_step": resumed_global_train_step},
+                ckpt_bytes,
+            )
+            train_state = restored["train_state"]
+            resumed_global_train_step = jnp.array(
+                restored["global_train_step"], dtype=jnp.int32
+            )
+
         # INIT ENV
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
@@ -238,7 +254,7 @@ def make_train(config):
                     (jnp.zeros_like(last_val), last_val),
                     traj_batch,
                     reverse=True,
-                    unroll=16,
+                    unroll=config.get("GAE_SCAN_UNROLL", 16),
                 )
                 return advantages, advantages + traj_batch.value #! Vt_target = At + V(st)
 
@@ -344,6 +360,30 @@ def make_train(config):
                 jax.debug.callback(callback, metric)
 
             runner_state = (train_state, env_state, last_obs, rng, global_train_step)
+
+            # Periodic checkpoint via host callback (no recompilation needed).
+            # global_train_step counts env steps; each _update_step adds NUM_STEPS.
+            _ckpt_interval = config.get("CHECKPOINT_INTERVAL_UPDATES", 0)
+            if _ckpt_interval > 0:
+                _ckpt_fn = config["CHECKPOINT_FN"]
+                _ckpt_period = jnp.array(
+                    _ckpt_interval * config["NUM_STEPS"], dtype=jnp.int32
+                )
+
+                def _do_ckpt(_):
+                    jax.debug.callback(_ckpt_fn, train_state, global_train_step)
+
+                def _skip_ckpt(_):
+                    pass
+
+                jax.lax.cond(
+                    (global_train_step > 0)
+                    & (global_train_step % _ckpt_period == 0),
+                    _do_ckpt,
+                    _skip_ckpt,
+                    operand=None,
+                )
+
             return runner_state, metric
 
         rng, _rng = jax.random.split(rng)
@@ -352,7 +392,7 @@ def make_train(config):
             env_state,
             obsv,
             _rng,
-            jnp.array(0, dtype=jnp.int32),
+            resumed_global_train_step,
         )
         runner_state, metric = jax.lax.scan(
             _update_step, runner_state, None, config["NUM_UPDATES"]
