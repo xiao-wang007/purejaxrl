@@ -7,6 +7,10 @@ from flax.linen.initializers import constant, orthogonal
 from typing import Sequence, NamedTuple, Any
 from flax.training.train_state import TrainState
 import distrax
+try:
+    import wandb
+except ImportError:
+    wandb = None
 from wrappers import (
     LogWrapper,
     BraxGymnaxWrapper,
@@ -68,12 +72,18 @@ class Transition(NamedTuple):
 
 
 def make_train(config):
+    if config.get("WANDB_LOG", False) and wandb is None:
+        raise ImportError(
+            "WANDB_LOG=True, but wandb is not installed. Install wandb or disable WANDB_LOG."
+        )
+
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
     config["MINIBATCH_SIZE"] = (
         config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
+    gae_scan_unroll = int(config.get("GAE_SCAN_UNROLL", 16))
     env_backend = config.get("ENV_BACKEND", "brax")
     if env_backend == "brax":
         env = BraxGymnaxWrapper(config["ENV_NAME"])
@@ -238,7 +248,7 @@ def make_train(config):
                     (jnp.zeros_like(last_val), last_val),
                     traj_batch,
                     reverse=True,
-                    unroll=16,
+                    unroll=gae_scan_unroll,
                 )
                 return advantages, advantages + traj_batch.value #! Vt_target = At + V(st)
 
@@ -327,6 +337,26 @@ def make_train(config):
             train_state = update_state[0]
             metric = traj_batch.info
             rng = update_state[-1]
+            if config.get("WANDB_LOG", False):
+
+                def wandb_callback(info, global_step):
+                    returned_episode = np.asarray(info["returned_episode"]).astype(bool)
+                    if not returned_episode.any():
+                        return
+                    returns = np.asarray(info["returned_episode_returns"])[returned_episode]
+                    lengths = np.asarray(info["returned_episode_lengths"])[returned_episode]
+                    wandb.log(
+                        {
+                            "train/episodic_return_mean": float(returns.mean()),
+                            "train/episodic_return_max": float(returns.max()),
+                            "train/episodic_length_mean": float(lengths.mean()),
+                            "train/episodes_finished": int(returned_episode.sum()),
+                        },
+                        step=int(np.asarray(global_step)),
+                    )
+
+                jax.debug.callback(wandb_callback, metric, global_train_step)
+
             if config.get("DEBUG"):
 
                 def callback(info):
@@ -354,10 +384,22 @@ def make_train(config):
             _rng,
             jnp.array(0, dtype=jnp.int32),
         )
-        runner_state, metric = jax.lax.scan(
-            _update_step, runner_state, None, config["NUM_UPDATES"]
+        if config.get("COLLECT_METRICS", True):
+            runner_state, metric = jax.lax.scan(
+                _update_step, runner_state, None, config["NUM_UPDATES"]
+            )
+            return {"runner_state": runner_state, "metrics": metric}
+
+        # Avoid stacking per-update metrics to keep memory near-constant
+        # as NUM_UPDATES grows.
+        def _fori_update(_, carry):
+            carry, _ = _update_step(carry, None)
+            return carry
+
+        runner_state = jax.lax.fori_loop(
+            0, config["NUM_UPDATES"], _fori_update, runner_state
         )
-        return {"runner_state": runner_state, "metrics": metric}
+        return {"runner_state": runner_state}
 
     return train
 
@@ -365,7 +407,7 @@ def make_train(config):
 if __name__ == "__main__":
     config = {
         "LR": 3e-4,
-        "NUM_ENVS": 2048,
+        "NUM_ENVS": 512,
         "NUM_STEPS": 200,  # my dt policy = 0.02, this is 4s rollout 
         "TOTAL_TIMESTEPS": 5e7,
         "UPDATE_EPOCHS": 4,
