@@ -1,13 +1,19 @@
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
+from flax import serialization
 import numpy as np
 import optax
+import os
 from flax.linen.initializers import constant, orthogonal
 from typing import Sequence, NamedTuple, Any
 from flax.training.train_state import TrainState
 from flax import serialization
 import distrax
+try:
+    import wandb
+except ImportError:
+    wandb = None
 from wrappers import (
     LogWrapper,
     BraxGymnaxWrapper,
@@ -69,12 +75,18 @@ class Transition(NamedTuple):
 
 
 def make_train(config):
+    if config.get("WANDB_LOG", False) and wandb is None:
+        raise ImportError(
+            "WANDB_LOG=True, but wandb is not installed. Install wandb or disable WANDB_LOG."
+        )
+
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
     config["MINIBATCH_SIZE"] = (
         config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
+    gae_scan_unroll = int(config.get("GAE_SCAN_UNROLL", 16))
     env_backend = config.get("ENV_BACKEND", "brax")
     if env_backend == "brax":
         env = BraxGymnaxWrapper(config["ENV_NAME"])
@@ -148,6 +160,24 @@ def make_train(config):
             params=network_params,
             tx=tx,
         )
+        start_global_train_step = jnp.array(0, dtype=jnp.int32)
+        resume_path = config.get("RESUME_CHECKPOINT_PATH")
+        if resume_path:
+            if not os.path.exists(resume_path):
+                raise FileNotFoundError(
+                    f"RESUME_CHECKPOINT_PATH does not exist: {resume_path}"
+                )
+            with open(resume_path, "rb") as f:
+                checkpoint_bytes = f.read()
+            checkpoint_template = {
+                "train_state": train_state,
+                "global_train_step": jnp.array(0, dtype=jnp.int32),
+            }
+            checkpoint_data = serialization.from_bytes(
+                checkpoint_template, checkpoint_bytes
+            )
+            train_state = checkpoint_data["train_state"]
+            start_global_train_step = checkpoint_data["global_train_step"]
 
         # --- Resume from checkpoint if provided ---
         resumed_global_train_step = jnp.array(0, dtype=jnp.int32)
@@ -254,7 +284,7 @@ def make_train(config):
                     (jnp.zeros_like(last_val), last_val),
                     traj_batch,
                     reverse=True,
-                    unroll=config.get("GAE_SCAN_UNROLL", 16),
+                    unroll=gae_scan_unroll,
                 )
                 return advantages, advantages + traj_batch.value #! Vt_target = At + V(st)
 
@@ -281,7 +311,8 @@ def make_train(config):
                         )
 
                         # CALCULATE ACTOR LOSS
-                        ratio = jnp.exp(log_prob - traj_batch.log_prob)
+                        log_ratio = log_prob - traj_batch.log_prob
+                        ratio = jnp.exp(log_ratio)
                         gae = (gae - gae.mean()) / (gae.std() + 1e-8)
                         loss_actor1 = ratio * gae
                         loss_actor2 = (
@@ -295,13 +326,25 @@ def make_train(config):
                         loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
                         loss_actor = loss_actor.mean()
                         entropy = pi.entropy().mean()
+                        approx_kl = jnp.mean((ratio - 1.0) - log_ratio)
+                        clip_fraction = jnp.mean(
+                            (jnp.abs(ratio - 1.0) > config["CLIP_EPS"]).astype(
+                                jnp.float32
+                            )
+                        )
 
                         total_loss = (
                             loss_actor
                             + config["VF_COEF"] * value_loss
                             - config["ENT_COEF"] * entropy
                         )
-                        return total_loss, (value_loss, loss_actor, entropy)
+                        return total_loss, (
+                            value_loss,
+                            loss_actor,
+                            entropy,
+                            approx_kl,
+                            clip_fraction,
+                        )
 
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                     total_loss, grads = grad_fn(
@@ -343,21 +386,128 @@ def make_train(config):
             train_state = update_state[0]
             metric = traj_batch.info
             rng = update_state[-1]
+            env_transition_step = global_train_step * jnp.array(
+                config["NUM_ENVS"], dtype=jnp.int32
+            )
+            n_updates = global_train_step // jnp.array(
+                config["NUM_STEPS"], dtype=jnp.int32
+            )
+            total_loss_mean = jnp.mean(loss_info[0])
+            value_loss_mean = jnp.mean(loss_info[1][0])
+            policy_gradient_loss_mean = jnp.mean(loss_info[1][1])
+            entropy_mean = jnp.mean(loss_info[1][2])
+            approx_kl_mean = jnp.mean(loss_info[1][3])
+            clip_fraction_mean = jnp.mean(loss_info[1][4])
+            explained_variance = 1.0 - (
+                jnp.var(targets - traj_batch.value)
+                / (jnp.var(targets) + 1e-8)
+            )
+            current_lr = (
+                linear_schedule(n_updates * config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])
+                if config["ANNEAL_LR"]
+                else config["LR"]
+            )
+            if config.get("WANDB_LOG", False):
+
+                def wandb_callback(
+                    info,
+                    env_step,
+                    policy_step,
+                    n_updates_value,
+                    current_lr_value,
+                    total_loss_value,
+                    value_loss_value,
+                    policy_gradient_loss_value,
+                    entropy_value,
+                    approx_kl_value,
+                    clip_fraction_value,
+                    explained_variance_value,
+                ):
+                    returned_episode = np.asarray(info["returned_episode"]).astype(bool)
+                    log_data = {
+                        "train/approx_kl": float(np.asarray(approx_kl_value)),
+                        "train/clip_fraction": float(np.asarray(clip_fraction_value)),
+                        "train/clip_range": float(config["CLIP_EPS"]),
+                        "train/entropy_loss": -float(np.asarray(entropy_value)),
+                        "train/explained_variance": float(
+                            np.asarray(explained_variance_value)
+                        ),
+                        "train/learning_rate": float(np.asarray(current_lr_value)),
+                        "train/loss": float(np.asarray(total_loss_value)),
+                        "train/policy_gradient_loss": float(
+                            np.asarray(policy_gradient_loss_value)
+                        ),
+                        "train/value_loss": float(np.asarray(value_loss_value)),
+                        "train/n_updates": int(np.asarray(n_updates_value)),
+                        "time/iterations": int(np.asarray(n_updates_value)),
+                        "time/total_timesteps": int(np.asarray(env_step)),
+                        "train/policy_step": int(np.asarray(policy_step)),
+                        "train/env_transition_step": int(np.asarray(env_step)),
+                    }
+                    if returned_episode.any():
+                        returns = np.asarray(info["returned_episode_returns"])[
+                            returned_episode
+                        ]
+                        lengths = np.asarray(info["returned_episode_lengths"])[
+                            returned_episode
+                        ]
+                        log_data["rollout/ep_rew_mean"] = float(returns.mean())
+                        log_data["rollout/ep_len_mean"] = float(lengths.mean())
+                        log_data["train/episodes_finished"] = int(returned_episode.sum())
+
+                    wandb.log(log_data, step=int(np.asarray(env_step)))
+
+                jax.debug.callback(
+                    wandb_callback,
+                    metric,
+                    env_transition_step,
+                    global_train_step,
+                    n_updates,
+                    current_lr,
+                    total_loss_mean,
+                    value_loss_mean,
+                    policy_gradient_loss_mean,
+                    entropy_mean,
+                    approx_kl_mean,
+                    clip_fraction_mean,
+                    explained_variance,
+                )
+
             if config.get("DEBUG"):
 
-                def callback(info):
-                    return_values = info["returned_episode_returns"][
-                        info["returned_episode"]
-                    ]
-                    timesteps = (
-                        info["timestep"][info["returned_episode"]] * config["NUM_ENVS"]
+                def callback(info, env_step):
+                    total_timesteps = int(config["TOTAL_TIMESTEPS"])
+                    env_step_int = int(np.asarray(env_step))
+                    progress = (
+                        min(env_step_int / total_timesteps, 1.0)
+                        if total_timesteps > 0
+                        else 1.0
                     )
-                    for t in range(len(timesteps)):
-                        print(
-                            f"global step={timesteps[t]}, episodic return={return_values[t]}"
+                    bar_width = 36
+                    filled = int(bar_width * progress)
+                    bar = "#" * filled + "-" * (bar_width - filled)
+
+                    returned_episode = np.asarray(info["returned_episode"]).astype(bool)
+                    suffix = ""
+                    if returned_episode.any():
+                        returns = np.asarray(info["returned_episode_returns"])[
+                            returned_episode
+                        ]
+                        suffix = (
+                            f" | ep_rew_mean={float(returns.mean()):.4f}"
+                            f" | episodes={int(returned_episode.sum())}"
                         )
 
-                jax.debug.callback(callback, metric)
+                    print(
+                        f"\rprogress [{bar}] {progress * 100:6.2f}% "
+                        f"({env_step_int}/{total_timesteps}){suffix}",
+                        end="",
+                        flush=True,
+                    )
+                    if env_step_int >= total_timesteps:
+                        print()
+
+                jax.debug.callback(callback, metric, env_transition_step)
 
             runner_state = (train_state, env_state, last_obs, rng, global_train_step)
 
@@ -394,10 +544,22 @@ def make_train(config):
             _rng,
             resumed_global_train_step,
         )
-        runner_state, metric = jax.lax.scan(
-            _update_step, runner_state, None, config["NUM_UPDATES"]
+        if config.get("COLLECT_METRICS", True):
+            runner_state, metric = jax.lax.scan(
+                _update_step, runner_state, None, config["NUM_UPDATES"]
+            )
+            return {"runner_state": runner_state, "metrics": metric}
+
+        # Avoid stacking per-update metrics to keep memory near-constant
+        # as NUM_UPDATES grows.
+        def _fori_update(_, carry):
+            carry, _ = _update_step(carry, None)
+            return carry
+
+        runner_state = jax.lax.fori_loop(
+            0, config["NUM_UPDATES"], _fori_update, runner_state
         )
-        return {"runner_state": runner_state, "metrics": metric}
+        return {"runner_state": runner_state}
 
     return train
 
@@ -405,7 +567,7 @@ def make_train(config):
 if __name__ == "__main__":
     config = {
         "LR": 3e-4,
-        "NUM_ENVS": 2048,
+        "NUM_ENVS": 512,
         "NUM_STEPS": 200,  # my dt policy = 0.02, this is 4s rollout 
         "TOTAL_TIMESTEPS": 5e7,
         "UPDATE_EPOCHS": 4,
