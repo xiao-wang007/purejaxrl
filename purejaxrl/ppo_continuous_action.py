@@ -5,6 +5,7 @@ from flax import serialization
 import numpy as np
 import optax
 import os
+import time
 from flax.linen.initializers import constant, orthogonal
 from typing import Sequence, NamedTuple, Any
 from flax.training.train_state import TrainState
@@ -86,6 +87,8 @@ def make_train(config):
     config["MINIBATCH_SIZE"] = (
         config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
+    perf_stats = config.get("PERF_STATS")
+    profile_perf = bool(config.get("PROFILE_PERF", False)) and perf_stats is not None
     gae_scan_unroll = int(config.get("GAE_SCAN_UNROLL", 16))
     env_backend = config.get("ENV_BACKEND", "brax")
     if env_backend == "brax":
@@ -407,10 +410,24 @@ def make_train(config):
                 if config["ANNEAL_LR"]
                 else config["LR"]
             )
+            # Reduce host callback payload to scalars computed on device.
+            returned_episode = metric["returned_episode"].astype(jnp.float32)
+            episodes_finished = jnp.sum(returned_episode)
+            episodes_finished_int = episodes_finished.astype(jnp.int32)
+            safe_den = jnp.maximum(episodes_finished, 1.0)
+            episode_return_mean = (
+                jnp.sum(metric["returned_episode_returns"] * returned_episode) / safe_den
+            )
+            episode_length_mean = (
+                jnp.sum(metric["returned_episode_lengths"] * returned_episode) / safe_den
+            )
             if config.get("WANDB_LOG", False):
+                _wandb_interval_updates = max(
+                    int(config.get("WANDB_LOG_INTERVAL_UPDATES", 1)), 1
+                )
+                _wandb_period = jnp.array(_wandb_interval_updates, dtype=jnp.int32)
 
                 def wandb_callback(
-                    info,
                     env_step,
                     policy_step,
                     n_updates_value,
@@ -422,8 +439,11 @@ def make_train(config):
                     approx_kl_value,
                     clip_fraction_value,
                     explained_variance_value,
+                    episodes_finished_value,
+                    episode_return_mean_value,
+                    episode_length_mean_value,
                 ):
-                    returned_episode = np.asarray(info["returned_episode"]).astype(bool)
+                    t_cb0 = time.perf_counter() if profile_perf else None
                     log_data = {
                         "train/approx_kl": float(np.asarray(approx_kl_value)),
                         "train/clip_fraction": float(np.asarray(clip_fraction_value)),
@@ -444,39 +464,61 @@ def make_train(config):
                         "train/policy_step": int(np.asarray(policy_step)),
                         "train/env_transition_step": int(np.asarray(env_step)),
                     }
-                    if returned_episode.any():
-                        returns = np.asarray(info["returned_episode_returns"])[
-                            returned_episode
-                        ]
-                        lengths = np.asarray(info["returned_episode_lengths"])[
-                            returned_episode
-                        ]
-                        log_data["rollout/ep_rew_mean"] = float(returns.mean())
-                        log_data["rollout/ep_len_mean"] = float(lengths.mean())
-                        log_data["train/episodes_finished"] = int(returned_episode.sum())
+                    episodes_finished_host = int(np.asarray(episodes_finished_value))
+                    if episodes_finished_host > 0:
+                        log_data["rollout/ep_rew_mean"] = float(
+                            np.asarray(episode_return_mean_value)
+                        )
+                        log_data["rollout/ep_len_mean"] = float(
+                            np.asarray(episode_length_mean_value)
+                        )
+                        log_data["train/episodes_finished"] = episodes_finished_host
 
                     wandb.log(log_data, step=int(np.asarray(env_step)))
+                    if profile_perf:
+                        perf_stats["wandb_calls"] = int(perf_stats.get("wandb_calls", 0)) + 1
+                        perf_stats["wandb_host_sec"] = float(
+                            perf_stats.get("wandb_host_sec", 0.0)
+                        ) + (time.perf_counter() - t_cb0)
 
-                jax.debug.callback(
-                    wandb_callback,
-                    metric,
-                    env_transition_step,
-                    global_train_step,
-                    n_updates,
-                    current_lr,
-                    total_loss_mean,
-                    value_loss_mean,
-                    policy_gradient_loss_mean,
-                    entropy_mean,
-                    approx_kl_mean,
-                    clip_fraction_mean,
-                    explained_variance,
+                def _do_wandb(_):
+                    jax.debug.callback(
+                        wandb_callback,
+                        env_transition_step,
+                        global_train_step,
+                        n_updates,
+                        current_lr,
+                        total_loss_mean,
+                        value_loss_mean,
+                        policy_gradient_loss_mean,
+                        entropy_mean,
+                        approx_kl_mean,
+                        clip_fraction_mean,
+                        explained_variance,
+                        episodes_finished_int,
+                        episode_return_mean,
+                        episode_length_mean,
+                    )
+
+                def _skip_wandb(_):
+                    pass
+
+                jax.lax.cond(
+                    (n_updates > 0) & (n_updates % _wandb_period == 0),
+                    _do_wandb,
+                    _skip_wandb,
+                    operand=None,
                 )
 
             if config.get("DEBUG"):
+                _debug_interval_updates = max(
+                    int(config.get("DEBUG_PRINT_INTERVAL_UPDATES", 1)), 1
+                )
+                _debug_period = jnp.array(_debug_interval_updates, dtype=jnp.int32)
+                total_timesteps = int(config["TOTAL_TIMESTEPS"])
 
-                def callback(info, env_step):
-                    total_timesteps = int(config["TOTAL_TIMESTEPS"])
+                def callback(env_step, episodes_finished_value, episode_return_mean_value):
+                    t_cb0 = time.perf_counter() if profile_perf else None
                     env_step_int = int(np.asarray(env_step))
                     progress = (
                         min(env_step_int / total_timesteps, 1.0)
@@ -487,15 +529,12 @@ def make_train(config):
                     filled = int(bar_width * progress)
                     bar = "#" * filled + "-" * (bar_width - filled)
 
-                    returned_episode = np.asarray(info["returned_episode"]).astype(bool)
                     suffix = ""
-                    if returned_episode.any():
-                        returns = np.asarray(info["returned_episode_returns"])[
-                            returned_episode
-                        ]
+                    episodes_finished_host = int(np.asarray(episodes_finished_value))
+                    if episodes_finished_host > 0:
                         suffix = (
-                            f" | ep_rew_mean={float(returns.mean()):.4f}"
-                            f" | episodes={int(returned_episode.sum())}"
+                            f" | ep_rew_mean={float(np.asarray(episode_return_mean_value)):.4f}"
+                            f" | episodes={episodes_finished_host}"
                         )
 
                     print(
@@ -506,8 +545,29 @@ def make_train(config):
                     )
                     if env_step_int >= total_timesteps:
                         print()
+                    if profile_perf:
+                        perf_stats["debug_calls"] = int(perf_stats.get("debug_calls", 0)) + 1
+                        perf_stats["debug_host_sec"] = float(
+                            perf_stats.get("debug_host_sec", 0.0)
+                        ) + (time.perf_counter() - t_cb0)
 
-                jax.debug.callback(callback, metric, env_transition_step)
+                def _do_debug(_):
+                    jax.debug.callback(
+                        callback,
+                        env_transition_step,
+                        episodes_finished_int,
+                        episode_return_mean,
+                    )
+
+                def _skip_debug(_):
+                    pass
+
+                jax.lax.cond(
+                    (n_updates > 0) & (n_updates % _debug_period == 0),
+                    _do_debug,
+                    _skip_debug,
+                    operand=None,
+                )
 
             runner_state = (train_state, env_state, last_obs, rng, global_train_step)
 
