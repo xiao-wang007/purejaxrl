@@ -87,6 +87,18 @@ def make_train(config):
     config["MINIBATCH_SIZE"] = (
         config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
+    total_timesteps_target = int(
+        config.get("TOTAL_TIMESTEPS_TARGET", config["TOTAL_TIMESTEPS"])
+    )
+    total_global_train_steps = jnp.array(
+        max(total_timesteps_target // config["NUM_ENVS"], 1), dtype=jnp.float32
+    )
+    gain_schedule_split = jnp.array(
+        float(config.get("GAIN_SCHEDULE_SPLIT", 0.6)), dtype=jnp.float32
+    )
+    gain_schedule_end = jnp.array(
+        float(config.get("GAIN_SCHEDULE_END", 1.0)), dtype=jnp.float32
+    )
     perf_stats = config.get("PERF_STATS")
     profile_perf = bool(config.get("PROFILE_PERF", False)) and perf_stats is not None
     gae_scan_unroll = int(config.get("GAE_SCAN_UNROLL", 16))
@@ -228,7 +240,17 @@ def make_train(config):
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
                 rng_step = jax.random.split(_rng, config["NUM_ENVS"])
-                step_env_params = {"train_step": global_train_step}
+                train_progress = jnp.clip(
+                    global_train_step.astype(jnp.float32) / total_global_train_steps,
+                    0.0,
+                    1.0,
+                )
+                step_env_params = {
+                    "train_step": global_train_step,
+                    "train_progress": train_progress,
+                    "gain_schedule_split": gain_schedule_split,
+                    "gain_schedule_end": gain_schedule_end,
+                }
                 obsv, env_state, reward, done, info = env.step(
                     rng_step, env_state, action, step_env_params
                 )

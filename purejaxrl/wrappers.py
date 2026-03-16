@@ -335,8 +335,10 @@ class TransformReward(GymnaxWrapper):
 
 
 class VecEnv(GymnaxWrapper):
+    #! this batches the wrapped env using MJXGymnax wrapper 
     def __init__(self, env):
         super().__init__(env)
+        #TODO: revisit the functionalities of vmap here
         self.reset = jax.vmap(self._env.reset, in_axes=(0, None))
         self.step = jax.vmap(self._env.step, in_axes=(0, 0, 0, None))
 
