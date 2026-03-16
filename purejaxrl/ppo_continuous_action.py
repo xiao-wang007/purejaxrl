@@ -6,10 +6,10 @@ import numpy as np
 import optax
 import os
 import time
+from collections.abc import Mapping
 from flax.linen.initializers import constant, orthogonal
 from typing import Sequence, NamedTuple, Any
 from flax.training.train_state import TrainState
-from flax import serialization
 import distrax
 try:
     import wandb
@@ -73,6 +73,38 @@ class Transition(NamedTuple):
     log_prob: jnp.ndarray
     obs: jnp.ndarray
     info: jnp.ndarray
+
+
+def _find_tree_shape_mismatches(
+    expected_tree: Any, restored_tree: Any, path: str = ""
+) -> list[tuple[str, Any, Any]]:
+    """Collect shape mismatches between two parameter pytrees."""
+    mismatches: list[tuple[str, Any, Any]] = []
+    if isinstance(expected_tree, Mapping):
+        if not isinstance(restored_tree, Mapping):
+            mismatches.append((path or "<root>", "mapping", type(restored_tree).__name__))
+            return mismatches
+        for key in expected_tree.keys():
+            child_path = f"{path}/{key}" if path else str(key)
+            if key not in restored_tree:
+                mismatches.append((child_path, "missing", None))
+                continue
+            mismatches.extend(
+                _find_tree_shape_mismatches(
+                    expected_tree[key], restored_tree[key], child_path
+                )
+            )
+        for key in restored_tree.keys():
+            if key not in expected_tree:
+                child_path = f"{path}/{key}" if path else str(key)
+                mismatches.append((child_path, None, "unexpected"))
+        return mismatches
+
+    expected_shape = tuple(expected_tree.shape) if hasattr(expected_tree, "shape") else None
+    restored_shape = tuple(restored_tree.shape) if hasattr(restored_tree, "shape") else None
+    if expected_shape != restored_shape:
+        mismatches.append((path or "<leaf>", expected_shape, restored_shape))
+    return mismatches
 
 
 def make_train(config):
@@ -175,7 +207,7 @@ def make_train(config):
             params=network_params,
             tx=tx,
         )
-        start_global_train_step = jnp.array(0, dtype=jnp.int32)
+        resumed_global_train_step = jnp.array(0, dtype=jnp.int32)
         resume_path = config.get("RESUME_CHECKPOINT_PATH")
         if resume_path:
             if not os.path.exists(resume_path):
@@ -191,22 +223,24 @@ def make_train(config):
             checkpoint_data = serialization.from_bytes(
                 checkpoint_template, checkpoint_bytes
             )
-            train_state = checkpoint_data["train_state"]
-            start_global_train_step = checkpoint_data["global_train_step"]
-
-        # --- Resume from checkpoint if provided ---
-        resumed_global_train_step = jnp.array(0, dtype=jnp.int32)
-        resume_path = config.get("RESUME_CHECKPOINT_PATH")
-        if resume_path is not None:
-            import pathlib
-            ckpt_bytes = pathlib.Path(resume_path).read_bytes()
-            restored = serialization.from_bytes(
-                {"train_state": train_state, "global_train_step": resumed_global_train_step},
-                ckpt_bytes,
+            mismatches = _find_tree_shape_mismatches(
+                train_state.params, checkpoint_data["train_state"].params
             )
-            train_state = restored["train_state"]
+            if mismatches:
+                mismatch_lines = "\n".join(
+                    f"  - {param_path}: expected {expected_shape}, checkpoint {restored_shape}"
+                    for param_path, expected_shape, restored_shape in mismatches[:8]
+                )
+                raise ValueError(
+                    "Checkpoint is incompatible with current model parameter shapes.\n"
+                    f"Checkpoint: {resume_path}\n"
+                    "This usually means the observation/action dimensions or network architecture changed.\n"
+                    f"First mismatches:\n{mismatch_lines}\n"
+                    "Delete or rename the checkpoint (and meta file) to start a fresh run."
+                )
+            train_state = checkpoint_data["train_state"]
             resumed_global_train_step = jnp.array(
-                restored["global_train_step"], dtype=jnp.int32
+                checkpoint_data["global_train_step"], dtype=jnp.int32
             )
 
         # INIT ENV
