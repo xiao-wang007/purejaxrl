@@ -539,10 +539,20 @@ def make_train(config):
                 )
                 _debug_period = jnp.array(_debug_interval_updates, dtype=jnp.int32)
                 total_timesteps = int(config["TOTAL_TIMESTEPS"])
+                progress_timing = {"last_host_time": None}
 
                 def callback(env_step, episodes_finished_value, episode_return_mean_value):
                     t_cb0 = time.perf_counter() if profile_perf else None
                     env_step_int = int(np.asarray(env_step))
+                    now_host_time = time.perf_counter()
+                    now_wall = time.strftime("%H:%M:%S", time.localtime())
+                    last_host_time = progress_timing["last_host_time"]
+                    progress_timing["last_host_time"] = now_host_time
+                    dt_suffix = (
+                        " | dt=--"
+                        if last_host_time is None
+                        else f" | dt={now_host_time - last_host_time:.2f}s"
+                    )
                     progress = (
                         min(env_step_int / total_timesteps, 1.0)
                         if total_timesteps > 0
@@ -562,7 +572,8 @@ def make_train(config):
 
                     print(
                         f"\rprogress [{bar}] {progress * 100:6.2f}% "
-                        f"({env_step_int}/{total_timesteps}){suffix}",
+                        f"({env_step_int}/{total_timesteps}){suffix}"
+                        f" | t={now_wall}{dt_suffix}",
                         end="",
                         flush=True,
                     )
