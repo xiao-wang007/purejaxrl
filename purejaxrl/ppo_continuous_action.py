@@ -410,6 +410,7 @@ def make_train(config):
                 if config["ANNEAL_LR"]
                 else config["LR"]
             )
+
             # Reduce host callback payload to scalars computed on device.
             returned_episode = metric["returned_episode"].astype(jnp.float32)
             episodes_finished = jnp.sum(returned_episode)
