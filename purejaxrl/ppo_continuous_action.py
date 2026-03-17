@@ -572,7 +572,12 @@ def make_train(config):
                     int(config.get("DEBUG_PRINT_INTERVAL_UPDATES", 1)), 1
                 )
                 _debug_period = jnp.array(_debug_interval_updates, dtype=jnp.int32)
-                total_timesteps = int(config["TOTAL_TIMESTEPS"])
+                
+                # Use the full training target for progress bars, not the
+                # per-run remaining chunk used during resume.
+                total_timesteps = int(
+                    config.get("TOTAL_TIMESTEPS_TARGET", config["TOTAL_TIMESTEPS"])
+                )
                 progress_timing = {"last_host_time": None}
 
                 def callback(env_step, episodes_finished_value, episode_return_mean_value):
@@ -672,6 +677,14 @@ def make_train(config):
             _rng,
             resumed_global_train_step,
         )
+        if config.get("COLLECT_METRICS", True):
+            runner_state, metric = jax.lax.scan(
+                _update_step, runner_state, None, config["NUM_UPDATES"]
+            )
+            return {"runner_state": runner_state, "metrics": metric}
+
+        # Avoid stacking per-update metrics to keep memory near-constant
+        # as NUM_UPDATES grows.
         def _fori_update(_, carry):
             carry, _ = _update_step(carry, None)
             return carry
