@@ -672,14 +672,6 @@ def make_train(config):
             _rng,
             resumed_global_train_step,
         )
-        if config.get("COLLECT_METRICS", True):
-            runner_state, metric = jax.lax.scan(
-                _update_step, runner_state, None, config["NUM_UPDATES"]
-            )
-            return {"runner_state": runner_state, "metrics": metric}
-
-        # Avoid stacking per-update metrics to keep memory near-constant
-        # as NUM_UPDATES grows.
         def _fori_update(_, carry):
             carry, _ = _update_step(carry, None)
             return carry
