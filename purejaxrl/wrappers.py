@@ -6,7 +6,6 @@ from flax import struct
 from functools import partial
 from typing import Optional, Tuple, Union, Any
 
-from torchaudio import info
 from gymnax.environments import environment, spaces
 from brax import envs
 from brax.envs.wrappers.training import EpisodeWrapper, AutoResetWrapper
