@@ -478,6 +478,23 @@ def make_train(config):
             episode_length_mean = (
                 jnp.sum(metric["returned_episode_lengths"] * returned_episode) / safe_den
             )
+            done_reason_keys = (
+                "done_time",
+                "done_noninfinite",
+                "done_qpos_low",
+                "done_qpos_high",
+                "done_qvel_low",
+                "done_qvel_high",
+            )
+
+            #! metric here is of shape [6, num_envs]
+            if all(k in metric for k in done_reason_keys):
+                done_reason_counts = jnp.array(
+                    [jnp.sum(metric[k]) for k in done_reason_keys], dtype=jnp.int32
+                )
+            else:
+                done_reason_counts = jnp.zeros((6,), dtype=jnp.int32)
+            
             if config.get("WANDB_LOG", False):
                 _wandb_interval_updates = max(
                     int(config.get("WANDB_LOG_INTERVAL_UPDATES", 1)), 1
@@ -580,7 +597,12 @@ def make_train(config):
                 )
                 progress_timing = {"last_host_time": None}
 
-                def callback(env_step, episodes_finished_value, episode_return_mean_value):
+                def callback(
+                    env_step,
+                    episodes_finished_value,
+                    episode_return_mean_value,
+                    done_reason_counts_value,
+                ):
                     t_cb0 = time.perf_counter() if profile_perf else None
                     env_step_int = int(np.asarray(env_step))
                     now_host_time = time.perf_counter()
@@ -601,16 +623,17 @@ def make_train(config):
                     filled = int(bar_width * progress)
                     bar = "#" * filled + "-" * (bar_width - filled)
 
-                    suffix = ""
+                    done_counts_host = np.asarray(done_reason_counts_value).astype(np.int64)
+                    suffix = f" | done_counts={done_counts_host.tolist()}"
                     episodes_finished_host = int(np.asarray(episodes_finished_value))
                     if episodes_finished_host > 0:
-                        suffix = (
-                            f" | ep_rew_mean={float(np.asarray(episode_return_mean_value)):.4f}"
-                            f" | episodes={episodes_finished_host}"
+                        suffix += (
+                            f" | eps_r_mean={float(np.asarray(episode_return_mean_value)):.4f}"
+                            f" | eps_done={episodes_finished_host}"
                         )
 
                     print(
-                        f"\rprogress [{bar}] {progress * 100:6.2f}% "
+                        f"\r[{bar}] {progress * 100:6.2f}% "
                         f"({env_step_int}/{total_timesteps}){suffix}"
                         f" | t={now_wall}{dt_suffix}",
                         end="",
@@ -630,6 +653,7 @@ def make_train(config):
                         env_transition_step,
                         episodes_finished_int,
                         episode_return_mean,
+                        done_reason_counts,
                     )
 
                 def _skip_debug(_):

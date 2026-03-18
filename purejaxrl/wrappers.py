@@ -5,6 +5,8 @@ import numpy as np
 from flax import struct
 from functools import partial
 from typing import Optional, Tuple, Union, Any
+
+from torchaudio import info
 from gymnax.environments import environment, spaces
 from brax import envs
 from brax.envs.wrappers.training import EpisodeWrapper, AutoResetWrapper
@@ -208,6 +210,18 @@ class MJXGymnaxWrapper:
                 "Provide one of done_attr_names in MJXGymnaxWrapper."
             )
         return done > 0.5
+    
+    def _extract_info(self, state):
+        done_info = state.done_info 
+        info = {
+                "done_time": done_info[0],
+                "done_noninfinite": done_info[1],
+                "done_qpos_low": done_info[2],
+                "done_qpos_high": done_info[3],
+                "done_qvel_low": done_info[4],
+                "done_qvel_high": done_info[5]
+        }
+        return info
 
     def _call_with_optional_params(self, fn, *args, params=None):
         if params is None:
@@ -237,7 +251,8 @@ class MJXGymnaxWrapper:
         obs = self._extract_obs(next_state)
         reward = self._extract_reward(next_state)
         done = self._extract_done(next_state)
-        return obs, next_state, reward, done, {}
+        info = self._extract_info(next_state) if hasattr(self, "_extract_info") else {}
+        return obs, next_state, reward, done, info
 
     def observation_space(self, params):
         del params
