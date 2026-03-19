@@ -633,14 +633,11 @@ def make_train(config):
                         )
 
                     print(
-                        f"\r[{bar}] {progress * 100:6.2f}% "
+                        f"[{bar}] {progress * 100:6.2f}% "
                         f"({env_step_int}/{total_timesteps}){suffix}"
                         f" | t={now_wall}{dt_suffix}",
-                        end="",
                         flush=True,
                     )
-                    if env_step_int >= total_timesteps:
-                        print()
                     if profile_perf:
                         perf_stats["debug_calls"] = int(perf_stats.get("debug_calls", 0)) + 1
                         perf_stats["debug_host_sec"] = float(
