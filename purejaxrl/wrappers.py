@@ -218,7 +218,8 @@ class MJXGymnaxWrapper:
                 "done_qpos_low": done_info[2],
                 "done_qpos_high": done_info[3],
                 "done_qvel_low": done_info[4],
-                "done_qvel_high": done_info[5]
+                "done_qvel_high": done_info[5],
+                "mid_done": done_info[6],
         }
         return info
 

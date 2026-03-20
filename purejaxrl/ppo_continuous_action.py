@@ -485,6 +485,7 @@ def make_train(config):
                 "done_qpos_high",
                 "done_qvel_low",
                 "done_qvel_high",
+                "mid_done",
             )
 
             #! metric here is of shape [6, num_envs]
@@ -493,7 +494,7 @@ def make_train(config):
                     [jnp.sum(metric[k]) for k in done_reason_keys], dtype=jnp.int32
                 )
             else:
-                done_reason_counts = jnp.zeros((6,), dtype=jnp.int32)
+                done_reason_counts = jnp.zeros((7,), dtype=jnp.int32)
             
             if config.get("WANDB_LOG", False):
                 _wandb_interval_updates = max(
